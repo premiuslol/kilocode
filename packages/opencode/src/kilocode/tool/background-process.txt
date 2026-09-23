@@ -21,6 +21,10 @@ Monitor:
 - `monitor` also stops as soon as the process exits. Reaching either cap does not stop the process: it keeps running as a normal background process, and the result names the process `id` so you can follow up with `logs`, `status`, or `stop`.
 - Prefer `monitor` over `start` plus repeated `logs` when you need the output of a command that finishes on its own, such as a build, a test run, or a deploy. Use `start` for servers and watchers that should outlive the call.
 
+Goals:
+- In a session goal, `monitor` blocks the goal turn until the process stops, so the goal does not spin while the process runs; the process exit resumes the goal.
+- A non-terminal `start` suspends the goal until the process exits, and the exit resumes the goal.
+
 Lifetime options for `start`:
 - By default, the process stops when its session ends, the user switches session groups, or Kilo exits.
 - Set `inherit: true` only from a subagent when the process should transfer to the immediate parent session after the subagent ends. It then follows the parent session lifetime.
