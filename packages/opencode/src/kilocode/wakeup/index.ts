@@ -1,10 +1,13 @@
 import { KiloShutdown } from "@/kilocode/cli/shutdown"
+import { GoalLink } from "@/kilocode/session/goal/link"
+import { GoalState } from "@/kilocode/session/goal/state"
+import { Session } from "@/session/session"
 import { SessionID } from "@/session/schema"
 import { Storage } from "@/storage/storage"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { WakeupEvent } from "@opencode-ai/schema/kilocode/wakeup-event"
-import { Context, Effect, Fiber, Layer, Semaphore } from "effect"
+import { Context, Effect, Fiber, Layer, Option, Semaphore } from "effect"
 import { fireLayer, text as wakeupText } from "./resume"
 import * as schema from "./schema"
 
@@ -373,6 +376,31 @@ export namespace Wakeup {
         )
       })
 
+      // Drop the persisted wait for a cancelled id so drive cannot re-suspend
+      // a recurring task that no longer exists (D5). Session is optional: the
+      // isolated wakeup tests have no session layer.
+      const forget = (sessionID: SessionID, id: ID) =>
+        Effect.gen(function* () {
+          const sessions = Option.getOrUndefined(yield* Effect.serviceOption(Session.Service))
+          if (!sessions) return
+          const session = yield* sessions.get(sessionID).pipe(Effect.catch(() => Effect.succeed(undefined)))
+          if (!session) return
+          const goal = GoalState.read(session.metadata)
+          if (!goal?.wait || goal.wait.id !== id) return
+          yield* sessions.setMetadata({
+            sessionID,
+            metadata: {
+              ...session.metadata,
+              "kilo.goal": {
+                text: goal.text,
+                status: goal.status,
+                active: goal.active,
+                ...(goal.reason ? { reason: goal.reason } : {}),
+              },
+            },
+          })
+        }).pipe(Effect.catchCause((cause) => Effect.logError("wakeup drop wait failed", { sessionID, id, cause })))
+
       const cancel = Effect.fn("Wakeup.cancel")(function* (id: ID, sessionID?: SessionID) {
         const info = yield* lookup(id)
         if (!info || (sessionID && info.sessionID !== sessionID)) return undefined
@@ -384,6 +412,13 @@ export namespace Wakeup {
         entries.delete(id)
         yield* storage.remove(key(info)).pipe(Effect.ignore)
         yield* announce(info.sessionID)
+        const wait = GoalLink.get(info.sessionID)
+        if (wait?.id === info.id) {
+          yield* forget(info.sessionID, info.id)
+          yield* GoalLink.resumeOrQueue(info.sessionID, "[cancelled] " + info.id, wait).pipe(
+            Effect.catchCause((cause) => Effect.logError("wakeup cancel notify failed", { id: info.id, cause })),
+          )
+        }
         return info
       })
 
@@ -397,6 +432,13 @@ export namespace Wakeup {
         }
         cronEntries.delete(id)
         yield* storage.remove(cronKey(task)).pipe(Effect.ignore)
+        const wait = GoalLink.get(task.sessionID)
+        if (wait?.id === task.id) {
+          yield* forget(task.sessionID, task.id)
+          yield* GoalLink.resumeOrQueue(task.sessionID, "[cancelled] " + task.id, wait).pipe(
+            Effect.catchCause((cause) => Effect.logError("cron cancel notify failed", { id: task.id, cause })),
+          )
+        }
         return task
       })
 
@@ -410,6 +452,12 @@ export namespace Wakeup {
         for (const task of scheduled) yield* cronCancel(task.id)
         return held.length + scheduled.length
       })
+
+      // Register once per Wakeup layer build so a goal that settles, pauses, or
+      // clears cancels the session's timers through the same service that armed
+      // them (D11). Clearing the wait record first in the goal's cleanup path
+      // makes the cancel notify above a no-op during teardown.
+      yield* Effect.sync(() => GoalLink.registerCleanup((id) => cancelSession(id)))
 
       const adopt = Effect.fn("Wakeup.adopt")(function* (directory: string) {
         const keys = yield* storage.list(["wakeup"]).pipe(Effect.catch(() => Effect.succeed([] as string[][])))

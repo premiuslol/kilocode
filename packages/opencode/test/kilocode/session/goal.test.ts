@@ -2119,6 +2119,9 @@ it.instance(
     yield* Effect.sleep("6 seconds")
     expect(yield* run.llm.hits).toHaveLength(before)
     // Drop the real timer so the seam call below is the only fire this test sees.
+    // Clear the wait record first: a user cancel of an awaited id resumes the
+    // goal (D5), and that would steal this injected fire.
+    GoalLink.clear(run.session.id)
     yield* (yield* Wakeup.Service).cancel(wait.id as Wakeup.ID, run.session.id)
     // The fire the scheduler delivers resumes a goal turn carrying the goal's
     // own prompt plus the fired note, and that turn may report completion.
@@ -2166,6 +2169,7 @@ it.instance(
     expect(again.wait).toMatchObject({ kind: "cron", recurring: true, id: wait.id })
     const hits = yield* run.llm.hits
     expect(JSON.stringify(hits.at(before)?.body.messages)).toContain(note)
+    GoalLink.clear(run.session.id)
     yield* (yield* Wakeup.Service).cronCancel(wait.id as Wakeup.ID)
   }),
   30_000,
@@ -2221,7 +2225,10 @@ for (const kind of ["cron", "process"] as const) {
       const before = (yield* run.llm.hits).length
       yield* Effect.sleep("6 seconds")
       expect(yield* run.llm.hits).toHaveLength(before)
-      if (kind === "cron") yield* (yield* Wakeup.Service).cronCancel(wait.id as Wakeup.ID)
+      if (kind === "cron") {
+        GoalLink.clear(run.session.id)
+        yield* (yield* Wakeup.Service).cronCancel(wait.id as Wakeup.ID)
+      }
     }),
     30_000,
   )
@@ -2243,16 +2250,51 @@ it.instance(
     expect(yield* wake.list({ sessionID: run.session.id })).toHaveLength(1)
     // The cancel tool drops the awaited wakeup; the scheduler resumes the goal
     // instead of leaving it stranded on a wait that can never fire.
-    yield* wake.cancel(wait.id as Wakeup.ID, run.session.id)
-    expect(yield* wake.list({ sessionID: run.session.id })).toHaveLength(0)
     yield* run.llm.push(
       reply().tool("goal_report", { status: "complete", reason: "The wait was cancelled." }),
       reply().text("Final report").stop(),
     )
-    yield* GoalLink.resumeOrQueue(run.session.id, "[cancelled wakeup] Check the deploy", wait)
+    yield* wake.cancel(wait.id as Wakeup.ID, run.session.id)
+    expect(yield* wake.list({ sessionID: run.session.id })).toHaveLength(0)
     const done = yield* goalStatus(run, "complete")
     expect(done.active).toBe(false)
     expect(yield* wake.list({ sessionID: run.session.id })).toHaveLength(0)
+  }),
+  30_000,
+)
+
+it.instance(
+  "cancelling the awaited recurring cron does not re-suspend the goal on the deleted task",
+  Effect.gen(function* () {
+    const run = yield* setup()
+    const wake = yield* Wakeup.Service
+    yield* run.llm.push(
+      reply().tool("cron_create", { prompt: "Poll the deploy", cron: "0 0 * * *" }),
+      reply().text("Recurring task scheduled").stop(),
+    )
+    yield* run.command(objective)
+    const waiting = yield* goalStatus(run, "waiting")
+    const wait = waitOf(waiting)
+    expect(wait).toMatchObject({ kind: "cron", recurring: true })
+    expect(yield* wake.cronList({ sessionID: run.session.id })).toHaveLength(1)
+    // A leftover saved wait would re-suspend on the deleted task after this
+    // turn, because a recurring wait survives a normal fire-resume (D5).
+    yield* run.llm.push(reply().text("The wait was cancelled").stop())
+    yield* wake.cronCancel(wait.id as Wakeup.ID)
+    expect(yield* wake.cronList({ sessionID: run.session.id })).toHaveLength(0)
+    const next = yield* pollWithTimeout(
+      run.metadata.pipe(
+        Effect.map((value) => {
+          const goal = GoalState.read(value)
+          if (!goal || goal.status === "active") return undefined
+          return goal
+        }),
+      ),
+      "goal never settled after the cancelled cron",
+      "15 seconds",
+    )
+    expect(next.status).not.toBe("waiting")
+    expect(next.wait).toBeUndefined()
   }),
   30_000,
 )
@@ -2303,7 +2345,15 @@ it.instance(
       "goal did not release its cron tasks",
       "5 seconds",
     )
-    expect(calls).toBeGreaterThan(0)
+    // Production's own cleanup runs before this test's (it is registered when
+    // the Wakeup layer builds), and it empties the cron list first. Poll on the
+    // test counter instead of asserting, so the second cleanup fn's effect is
+    // observed rather than raced.
+    yield* pollWithTimeout(
+      Effect.sync(() => (calls > 0 ? true : undefined)),
+      "goal cleanup never ran",
+      "5 seconds",
+    )
   }),
   30_000,
 )

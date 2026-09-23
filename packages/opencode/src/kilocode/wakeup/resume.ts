@@ -2,6 +2,8 @@ import { Instance, provide } from "@/kilocode/instance"
 import { InstanceRef } from "@/effect/instance-ref"
 import * as Log from "@opencode-ai/core/util/log"
 import type { InstanceContext } from "@/project/instance-context"
+import { GoalLink } from "@/kilocode/session/goal/link"
+import { GoalState } from "@/kilocode/session/goal/state"
 import { Effect, Layer } from "effect"
 import { Fire, type Info } from "./schema"
 
@@ -23,7 +25,20 @@ async function resume(info: Info, inst?: InstanceContext, inPlace = false, kind?
       import("@/session/prompt"),
     ])
     const fn = async () => {
-      await AppRuntime.runPromise(Session.Service.use((svc) => svc.get(info.sessionID)))
+      const session = await AppRuntime.runPromise(Session.Service.use((svc) => svc.get(info.sessionID)))
+      // A waiting goal must resume as a goal turn (D2/D4), not as a stranger
+      // prompt and not as a paused-session refusal. An in-flight goal turn
+      // queues the fire instead of starting a second run (D3).
+      const goal = GoalState.read(session.metadata)
+      const wait = goal?.wait
+      if (
+        wait &&
+        (wait.id === info.id || (kind === "cron" && wait.kind === "cron" && wait.recurring === true)) &&
+        (goal?.status === "waiting" || goal?.status === "active" || GoalState.active(info.sessionID))
+      ) {
+        await AppRuntime.runPromise(GoalLink.resumeOrQueue(info.sessionID, text(info, kind), wait))
+        return
+      }
       // The prompt path drops a synthetic turn while the session is paused, so
       // the wake would vanish without a trace. Refuse it here and log instead.
       const paused = await AppRuntime.runPromise(SessionPrompt.Service.use((svc) => svc.paused(info.sessionID)))

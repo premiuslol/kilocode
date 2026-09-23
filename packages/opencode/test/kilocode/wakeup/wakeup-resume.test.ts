@@ -7,6 +7,7 @@ import { Effect } from "effect"
 import * as Log from "@opencode-ai/core/util/log"
 import { AppRuntime } from "@/effect/app-runtime"
 import { InstanceRef } from "@/effect/instance-ref"
+import { GoalState } from "@/kilocode/session/goal/state"
 import { Wakeup } from "@/kilocode/wakeup"
 import { InstanceStore } from "@/project/instance-store"
 import { Session } from "@/session/session"
@@ -50,6 +51,60 @@ function reply(text: string) {
       ctrl.close()
     },
   })
+}
+
+function tool(name: string, input: unknown) {
+  const enc = new TextEncoder()
+  return new ReadableStream<Uint8Array>({
+    start(ctrl) {
+      ctrl.enqueue(enc.encode(line(chunk({ delta: { role: "assistant" } }))))
+      ctrl.enqueue(
+        enc.encode(
+          line(
+            chunk({
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: `call_${name}_${crypto.randomUUID()}`,
+                    type: "function",
+                    function: { name, arguments: "" },
+                  },
+                ],
+              },
+            }),
+          ),
+        ),
+      )
+      ctrl.enqueue(
+        enc.encode(
+          line(
+            chunk({
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    function: { arguments: JSON.stringify(input) },
+                  },
+                ],
+              },
+            }),
+          ),
+        ),
+      )
+      ctrl.enqueue(enc.encode(line(chunk({ finish: "tool_calls" }))))
+      ctrl.enqueue(enc.encode("data: [DONE]\n\n"))
+      ctrl.close()
+    },
+  })
+}
+
+function transcript(body: string) {
+  try {
+    return JSON.stringify((JSON.parse(body) as { messages?: unknown }).messages ?? [])
+  } catch {
+    return body
+  }
 }
 
 // The runtime holds the wakeup timer's scope; dispose it once for the file.
@@ -215,6 +270,112 @@ describe("wakeup resume", () => {
 
       // The wake never reached the model.
       expect(bodies.some((body) => body.includes("[scheduled wakeup]"))).toBe(false)
+    } finally {
+      await server.stop(true)
+      await rm(dir, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  test("a fired wakeup for a waiting goal resumes the goal as a goal turn", async () => {
+    const bodies: string[] = []
+    const objective = "Improve the validation workflow"
+    const server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url)
+        if (!url.pathname.endsWith("/chat/completions")) return new Response("not found", { status: 404 })
+        const body = await req.text()
+        bodies.push(body)
+        if (body.includes("Generate a title")) {
+          return new Response(reply("Title"), {
+            status: 200,
+            headers: { "Content-Type": "text/event-stream" },
+          })
+        }
+        const history = transcript(body)
+        const stream = history.includes("Report recorded")
+          ? reply("Final report")
+          : history.includes("[scheduled wakeup]") && history.includes("Continue working toward this session goal")
+            ? tool("goal_report", { status: "complete", reason: "The deploy check passed." })
+            : history.includes("schedule_wakeup") || history.includes("Scheduled wakeup")
+              ? reply("Scheduled the check")
+              : tool("schedule_wakeup", {
+                  prompt: "Check the deploy",
+                  when: new Date(Date.now() + 1200).toISOString(),
+                  reason: "deploy",
+                })
+        return new Response(stream, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        })
+      },
+    })
+
+    const base = fs.realpathSync(os.tmpdir())
+    const dir = fs.mkdtempSync(path.join(base, "opencode-wakeup-goal-"))
+    try {
+      await Bun.write(path.join(dir, "opencode.json"), config(`${server.url.origin}/v1`))
+
+      const ctx = await AppRuntime.runPromise(InstanceStore.Service.use((store) => store.load({ directory: dir })))
+      const session = await AppRuntime.runPromise(
+        Session.Service.use((svc) => svc.create({ title: "Wakeup goal" })).pipe(
+          Effect.provideService(InstanceRef, ctx),
+        ),
+      )
+
+      await AppRuntime.runPromise(
+        SessionPrompt.Service.use((svc) =>
+          svc.command({
+            sessionID: session.id,
+            command: "goal",
+            arguments: objective,
+            agent: "code",
+            model: "test/test-model",
+          }),
+        ).pipe(Effect.provideService(InstanceRef, ctx)),
+      )
+
+      const read = () =>
+        Session.Service.use((svc) => svc.get(session.id)).pipe(
+          Effect.provideService(InstanceRef, ctx),
+          Effect.map((value) => GoalState.read(value.metadata)),
+        )
+
+      await AppRuntime.runPromise(
+        pollWithTimeout(
+          read().pipe(Effect.map((goal) => (goal?.status === "waiting" ? goal : undefined))),
+          "goal never reached waiting",
+          "15 seconds",
+        ),
+      )
+
+      await Effect.runPromise(
+        pollWithTimeout(
+          Effect.sync(() =>
+            bodies.some(
+              (body) =>
+                body.includes("Continue working toward this session goal") &&
+                body.includes(objective) &&
+                body.includes("[scheduled wakeup]") &&
+                body.includes("goal_report"),
+            )
+              ? true
+              : undefined,
+          ),
+          "the fired wakeup did not resume as a goal turn",
+          "15 seconds",
+        ),
+      )
+
+      const done = await AppRuntime.runPromise(
+        pollWithTimeout(
+          read().pipe(Effect.map((goal) => (goal?.status === "complete" ? goal : undefined))),
+          "goal never reached complete",
+          "15 seconds",
+        ),
+      )
+      expect(done.active).toBe(false)
+      expect(done.text).toBe(objective)
     } finally {
       await server.stop(true)
       await rm(dir, { recursive: true, force: true })
