@@ -31,7 +31,7 @@ export namespace GoalPolicy {
       return owner?.root === id && owner.current()
     }
     if (tool !== "question" && tool !== "goal") return true
-    if (GoalState.active(id)) return false
+    if (GoalState.hold(id)) return false
     const base = KiloSessionPromptQueue.active(id)
     return !base || !owners.get(base)?.current()
   }
