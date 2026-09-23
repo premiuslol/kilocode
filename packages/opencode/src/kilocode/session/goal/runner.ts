@@ -5,6 +5,7 @@ import type { EventV2 } from "@opencode-ai/core/event"
 import { Interrupted } from "@opencode-ai/schema/kilocode/session-drain"
 import { Command } from "@/command"
 import { EffectBridge } from "@/effect/bridge"
+import { InstanceRef } from "@/effect/instance-ref"
 import { InstanceState } from "@/effect/instance-state"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Permission } from "@/permission"
@@ -233,6 +234,7 @@ export namespace Goal {
       }
 
       const pause = Effect.fn("Goal.pause")(function* (id: SessionID, preserve = false) {
+        yield* ensure()
         // A waiting goal holds no run token but must still settle to paused and
         // release its timers, so read the hold before dropping it.
         const held = GoalState.hold(id)
@@ -475,6 +477,7 @@ export namespace Goal {
       })
 
       const command = Effect.fn("Goal.command")(function* (input: CommandInput) {
+        yield* ensure()
         const id = input.sessionID
         const args = input.arguments.trim()
         // The composer uses a delimiter so objectives can also be control words.
@@ -660,6 +663,7 @@ export namespace Goal {
       // the current turn: it arms the goal and lets the loop continue after the
       // turn drains, so the model can start or resume a goal itself.
       const arm = Effect.fn("Goal.arm")(function* (input: ArmInput) {
+        yield* ensure()
         const id = input.sessionID
         const session = yield* sessions.get(id).pipe(Effect.orDie)
         if (session.parentID) {
@@ -749,6 +753,18 @@ export namespace Goal {
           )
         }).pipe(Effect.ensuring(Effect.sync(() => claim.release())))
       })
+
+      const factory: GoalLink.Arm = (next) => arm({ sessionID: next.sessionID, action: next.action, note: next.note })
+      const ensure = Effect.fn("Goal.ensure")(function* () {
+        const ctx = yield* InstanceRef
+        if (!ctx) return
+        GoalLink.bind(ctx.directory, factory)
+        for (const session of yield* sessions.list()) {
+          GoalLink.hydrate(session.id, session.metadata, factory)
+        }
+      })
+      GoalLink.bind("", factory)
+      yield* ensure()
 
       return { command, pause, arm }
     })

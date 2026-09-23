@@ -401,6 +401,38 @@ export namespace Wakeup {
           })
         }).pipe(Effect.catchCause((cause) => Effect.logError("wakeup drop wait failed", { sessionID, id, cause })))
 
+      const recover = (sessionID: SessionID, id: ID): Effect.Effect<GoalLink.Wait | undefined> =>
+        Effect.gen(function* () {
+          const sessions = Option.getOrUndefined(yield* Effect.serviceOption(Session.Service))
+          if (!sessions) return undefined
+          const session = yield* sessions.get(sessionID).pipe(Effect.catch(() => Effect.succeed(undefined)))
+          if (!session) return undefined
+          const wait = GoalLink.hydrate(sessionID, session.metadata)
+          if (wait?.id !== id) return undefined
+          return wait
+        })
+
+      const notify = (
+        sessionID: SessionID,
+        id: ID,
+        directory: string,
+        kind: "wakeup" | "cron",
+      ): Effect.Effect<void> =>
+        Effect.gen(function* () {
+          const known = GoalLink.get(sessionID)
+          const wait = known?.id === id ? known : yield* recover(sessionID, id)
+          if (!wait || wait.id !== id) return
+          yield* forget(sessionID, id)
+          yield* GoalLink.resumeOrQueue(sessionID, "[cancelled] " + id, wait, directory).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logError(kind === "cron" ? "cron cancel notify failed" : "wakeup cancel notify failed", {
+                id,
+                cause,
+              }),
+            ),
+          )
+        })
+
       const cancel = Effect.fn("Wakeup.cancel")(function* (id: ID, sessionID?: SessionID) {
         const info = yield* lookup(id)
         if (!info || (sessionID && info.sessionID !== sessionID)) return undefined
@@ -412,13 +444,7 @@ export namespace Wakeup {
         entries.delete(id)
         yield* storage.remove(key(info)).pipe(Effect.ignore)
         yield* announce(info.sessionID)
-        const wait = GoalLink.get(info.sessionID)
-        if (wait?.id === info.id) {
-          yield* forget(info.sessionID, info.id)
-          yield* GoalLink.resumeOrQueue(info.sessionID, "[cancelled] " + info.id, wait).pipe(
-            Effect.catchCause((cause) => Effect.logError("wakeup cancel notify failed", { id: info.id, cause })),
-          )
-        }
+        yield* notify(info.sessionID, info.id, info.directory, "wakeup")
         return info
       })
 
@@ -432,13 +458,7 @@ export namespace Wakeup {
         }
         cronEntries.delete(id)
         yield* storage.remove(cronKey(task)).pipe(Effect.ignore)
-        const wait = GoalLink.get(task.sessionID)
-        if (wait?.id === task.id) {
-          yield* forget(task.sessionID, task.id)
-          yield* GoalLink.resumeOrQueue(task.sessionID, "[cancelled] " + task.id, wait).pipe(
-            Effect.catchCause((cause) => Effect.logError("cron cancel notify failed", { id: task.id, cause })),
-          )
-        }
+        yield* notify(task.sessionID, task.id, task.directory, "cron")
         return task
       })
 

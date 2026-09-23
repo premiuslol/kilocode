@@ -119,6 +119,38 @@ describe("GoalLink.resumeOrQueue", () => {
     const exit = await Effect.runPromiseExit(GoalLink.arm(id, { sessionID: id, action: "resume" }))
     expect(Exit.isFailure(exit)).toBe(true)
   })
+
+  test("arm uses the bound instance factory when no per-session handler exists", async () => {
+    const id = sid("bind")
+    const dir = `/tmp/goal-link-bind-${id}`
+    const calls: string[] = []
+    GoalLink.bind(dir, (input) =>
+      Effect.sync(() => {
+        calls.push(input.note ?? "")
+      }),
+    )
+    await Effect.runPromise(GoalLink.arm(id, { sessionID: id, action: "resume", note: "go" }, dir))
+    expect(calls).toEqual(["go"])
+  })
+})
+
+describe("GoalLink.hydrate", () => {
+  test("restores a waiting goal's wait record and hold", () => {
+    const id = sid("hydrate")
+    const wait: GoalLink.Wait = { kind: "wakeup", id: "wku_h", label: "later", dueAt: 5 }
+    expect(GoalLink.hydrate(id, { "kilo.goal": { text: "obj", status: "waiting", wait } })).toEqual(wait)
+    expect(GoalLink.get(id)).toEqual(wait)
+    expect(GoalState.waiting(id)).toBe(true)
+    expect(GoalState.hold(id)).toBe(true)
+    expect(GoalPolicy.available(id, "question")).toBe(false)
+  })
+
+  test("ignores a goal that is not waiting", () => {
+    const id = sid("hydrate-skip")
+    expect(GoalLink.hydrate(id, { "kilo.goal": { text: "obj", status: "active" } })).toBeUndefined()
+    expect(GoalLink.get(id)).toBeUndefined()
+    expect(GoalState.hold(id)).toBe(false)
+  })
 })
 
 describe("GoalLink.cleanup", () => {

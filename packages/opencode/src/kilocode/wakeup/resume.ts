@@ -31,17 +31,50 @@ async function resume(info: Info, inst?: InstanceContext, inPlace = false, kind?
       // queues the fire instead of starting a second run (D3).
       const goal = GoalState.read(session.metadata)
       const wait = goal?.wait
-      if (
-        wait &&
+      const matching =
+        !!wait &&
         (wait.id === info.id || (kind === "cron" && wait.kind === "cron" && wait.recurring === true)) &&
         (goal?.status === "waiting" || goal?.status === "active" || GoalState.active(info.sessionID))
-      ) {
-        await AppRuntime.runPromise(GoalLink.resumeOrQueue(info.sessionID, text(info, kind), wait))
+      // Construct SessionPrompt so Goal.make binds the instance factory and
+      // hydrates waiting sessions. Ignore the paused flag for a matching wait.
+      const paused = await AppRuntime.runPromise(SessionPrompt.Service.use((svc) => svc.paused(info.sessionID)))
+      if (matching && wait) {
+        GoalLink.hydrate(info.sessionID, session.metadata)
+        const note = text(info, kind)
+        try {
+          await AppRuntime.runPromise(GoalLink.resumeOrQueue(info.sessionID, note, wait, info.directory))
+        } catch (err) {
+          log.error("wakeup could not resume session", {
+            id: info.id,
+            sessionID: info.sessionID,
+            directory: info.directory,
+            err,
+          })
+          const latest = await AppRuntime.runPromise(Session.Service.use((svc) => svc.get(info.sessionID)))
+          const saved = GoalState.read(latest.metadata)
+          if (saved) {
+            await AppRuntime.runPromise(
+              Session.Service.use((svc) =>
+                svc.setMetadata({
+                  sessionID: info.sessionID,
+                  metadata: {
+                    ...latest.metadata,
+                    "kilo.goal": {
+                      text: saved.text,
+                      status: "paused",
+                      active: false,
+                      reason: err instanceof Error ? err.message : String(err),
+                    },
+                  },
+                }),
+              ),
+            )
+          }
+        }
         return
       }
       // The prompt path drops a synthetic turn while the session is paused, so
       // the wake would vanish without a trace. Refuse it here and log instead.
-      const paused = await AppRuntime.runPromise(SessionPrompt.Service.use((svc) => svc.paused(info.sessionID)))
       if (paused) {
         log.error("wakeup could not resume session", {
           id: info.id,

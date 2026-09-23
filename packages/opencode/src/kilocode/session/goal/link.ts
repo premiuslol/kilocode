@@ -89,13 +89,37 @@ export namespace GoalLink {
   export type Arm = (input: { sessionID: SessionID; action: "resume"; note?: string }) => Effect.Effect<unknown, Error>
 
   const arms = new Map<string, Arm>()
+  const factories = new Map<string, Arm>()
 
   export function registerArm(sessionID: SessionID, fn: Arm) {
     arms.set(sessionID, fn)
   }
 
-  export function arm(sessionID: SessionID, input: { sessionID: SessionID; action: "resume"; note?: string }) {
-    const fn = arms.get(sessionID)
+  /** One factory per instance directory, used after a restart when no session handler is registered. */
+  export function bind(directory: string, fn: Arm) {
+    factories.set(directory, fn)
+  }
+
+  /**
+   * Restore a persisted waiting goal: the wait record, the question-gate hold,
+   * and a per-session arm hook when the caller supplies one.
+   */
+  export function hydrate(sessionID: SessionID, metadata?: Record<string, unknown> | null, fn?: Arm) {
+    const goal = GoalState.read(metadata)
+    if (goal?.status !== "waiting" || !goal.wait) return undefined
+    set(sessionID, goal.wait)
+    GoalState.markWaiting(sessionID)
+    if (fn) registerArm(sessionID, fn)
+    return goal.wait
+  }
+
+  export function arm(
+    sessionID: SessionID,
+    input: { sessionID: SessionID; action: "resume"; note?: string },
+    directory?: string,
+  ) {
+    const factory = directory !== undefined ? (factories.get(directory) ?? factories.get("")) : undefined
+    const fn = arms.get(sessionID) ?? factory
     if (!fn) return Effect.fail(new Error("no goal resume handler"))
     return fn(input)
   }
@@ -118,12 +142,12 @@ export namespace GoalLink {
     return list
   }
 
-  export function resumeOrQueue(sessionID: SessionID, note: string, wait: Wait) {
+  export function resumeOrQueue(sessionID: SessionID, note: string, wait: Wait, directory?: string) {
     if (GoalState.active(sessionID)) {
       pushPending(sessionID, { note, wait })
       return Effect.void
     }
-    return arm(sessionID, { sessionID, action: "resume", note })
+    return arm(sessionID, { sessionID, action: "resume", note }, directory)
   }
 
   export type Cleanup = (sessionID: SessionID) => Effect.Effect<unknown, unknown>
