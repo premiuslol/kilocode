@@ -23,8 +23,10 @@ import { SessionRunState } from "@/session/run-state"
 import { MessageV2 } from "@/session/message-v2"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { Goal } from "@/kilocode/session/goal/runner"
+import { GoalLink } from "@/kilocode/session/goal/link"
 import { GoalPolicy } from "@/kilocode/session/goal/policy"
 import { GoalState } from "@/kilocode/session/goal/state"
+import { Wakeup } from "@/kilocode/wakeup"
 import { SessionDrain } from "@/kilocode/session/drain"
 import { KiloSessionContinuation } from "@/kilocode/session/continuation"
 import { KiloSessionPromptQueue } from "@/kilocode/session/prompt-queue"
@@ -50,6 +52,7 @@ const it = testEffect(
       Permission.node,
       Question.node,
       FSUtil.node,
+      Wakeup.node,
       LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] }),
     ]),
   ),
@@ -58,7 +61,15 @@ const it = testEffect(
 const objective = "Improve the validation workflow"
 const retained = { review: { branch: "feature" } }
 
-const shell = (command = "pwd") => reply().tool("bash", { command, description: "Check the validation workspace" })
+// A unique command per call: the harness shell refuses a repeated command and
+// this suite runs dozens of shell steps. A trailing comment keeps the command
+// unique without changing what it does; the no-argument default is read-only
+// and always exits 0.
+const shell = (command?: string) =>
+  reply().tool("bash", {
+    command: command ? `${command} # goal-${crypto.randomUUID()}` : `echo goal-step-${crypto.randomUUID()}`,
+    description: "Check the validation workspace",
+  })
 
 const setup = Effect.fnUntraced(function* (cfg: Partial<Config.Info> = {}) {
   const llm = yield* TestLLMServer
@@ -1096,7 +1107,7 @@ for (const busy of [true, false]) {
       const base = KiloSessionPromptQueue.active(run.session.id)
       const before = yield* run.sessions.messages({ sessionID: run.session.id })
       const exit = yield* run.prompt
-        .shell({ sessionID: run.session.id, agent: "code", command: "pwd" })
+        .shell({ sessionID: run.session.id, agent: "code", command: `echo goal-shell-${crypto.randomUUID()}` })
         .pipe(Effect.exit)
       if (busy) {
         expect(Exit.isFailure(exit) && Cause.squash(exit.cause) instanceof Session.BusyError).toBe(true)
@@ -1155,7 +1166,7 @@ it.instance(
       sessionID: session.id,
       permission: [{ permission: "bash", pattern: "*", action: "ask" }],
     })
-    yield* llm.tool("bash", { command: "pwd", description: "Check the workspace" })
+    yield* llm.tool("bash", { command: `echo goal-permission-${crypto.randomUUID()}`, description: "Check the workspace" })
     yield* command(objective)
     const pending = yield* pollWithTimeout(
       permission.list().pipe(Effect.map((items) => items.find((item) => item.sessionID === session.id))),
@@ -1915,7 +1926,7 @@ for (const kind of ["success", "delivery-error", "independent-child"] as const) 
       )
       yield* run.llm.pushMatch(
         ({ body }) => body.model === "selected-model",
-        shell(kind === "independent-child" ? "exit 1" : "pwd"),
+        shell(kind === "independent-child" ? "exit 1" : undefined),
         reply().wait(gate.promise).text("Child validation finished").stop(),
       )
       yield* run.llm.pushMatch(
@@ -2026,4 +2037,380 @@ test("distinguishes successful actions from failed work, bookkeeping, and hard b
     expect(Goal.action({ ...part, tool: "bash", state: { ...part.state, metadata: { exit } } })).toBe("failed")
   expect(Goal.action({ ...part, tool: "bash", state: { ...part.state, metadata: { exit: 0 } } })).toBe("success")
   expect(Goal.action({ ...part, tool: "task", state: { ...part.state, metadata: { background: true } } })).toBe("none")
+  // Scheduling bookkeeping is not a wait and not progress.
+  for (const tool of ["cancel_wakeup", "cron_list", "cron_delete"])
+    expect(Goal.action({ ...part, tool, state: { ...part.state, metadata: { id: "wku_1" } } })).toBe("none")
+  // An armed timer is the wait the goal suspends on; a capped or invalid call is not.
+  for (const tool of ["schedule_wakeup", "cron_create"])
+    expect(Goal.action({ ...part, tool, state: { ...part.state, metadata: { id: "wku_1" } } })).toBe("wait")
+  for (const tool of ["schedule_wakeup", "cron_create"])
+    expect(Goal.action({ ...part, tool, state: { ...part.state, metadata: {} } })).toBe("none")
+  // A live background process is a wait; a terminal start or monitor is done work.
+  expect(
+    Goal.action({
+      ...part,
+      tool: "background_process",
+      state: { ...part.state, input: { action: "start" }, metadata: { processID: "bgp_1", status: "running" } },
+    }),
+  ).toBe("wait")
+  for (const action of ["start", "monitor"])
+    expect(
+      Goal.action({
+        ...part,
+        tool: "background_process",
+        state: { ...part.state, input: { action }, metadata: { processID: "bgp_1", status: "exited" } },
+      }),
+    ).toBe("success")
+  for (const action of ["list", "status", "logs", "stop", "restart"])
+    expect(
+      Goal.action({
+        ...part,
+        tool: "background_process",
+        state: { ...part.state, input: { action }, metadata: { processID: "bgp_1", status: "exited" } },
+      }),
+    ).toBe("none")
+  // Inspecting a process that is still running is still a wait on that process.
+  expect(
+    Goal.action({
+      ...part,
+      tool: "background_process",
+      state: { ...part.state, input: { action: "status" }, metadata: { processID: "bgp_1", status: "running" } },
+    }),
+  ).toBe("wait")
 })
+
+type Run = Effect.Success<ReturnType<typeof setup>>
+type GoalRecord = NonNullable<ReturnType<typeof GoalState.read>>
+
+const goalStatus = (run: Run, status: GoalState.Status): Effect.Effect<GoalRecord, unknown, never> =>
+  pollWithTimeout(
+    run.metadata.pipe(
+      Effect.map((value) => {
+        const goal = GoalState.read(value)
+        return goal?.status === status ? goal : undefined
+      }),
+    ),
+    `goal never reached ${status}`,
+    "15 seconds",
+  )
+
+const waitOf = (goal: GoalRecord) => {
+  if (!goal.wait) throw new Error("the suspended goal has no wait record")
+  return goal.wait
+}
+
+it.instance(
+  "a schedule_wakeup turn suspends the goal and its fire resumes a goal turn",
+  Effect.gen(function* () {
+    const run = yield* setup()
+    yield* run.llm.push(
+      reply().tool("schedule_wakeup", { prompt: "Check the deploy", delay: "10s", reason: "deploy" }),
+      reply().text("Scheduled the check").stop(),
+    )
+    yield* run.command(objective)
+    const waiting = yield* goalStatus(run, "waiting")
+    const wait = waitOf(waiting)
+    expect(wait).toMatchObject({ kind: "wakeup" })
+    expect(wait.label).toBe("Check the deploy")
+    // A waiting goal still holds the session, so the question gate stays.
+    expect(GoalState.hold(run.session.id)).toBe(true)
+    // No goal turn runs before the wait fires.
+    const before = (yield* run.llm.hits).length
+    yield* Effect.sleep("6 seconds")
+    expect(yield* run.llm.hits).toHaveLength(before)
+    // Drop the real timer so the seam call below is the only fire this test sees.
+    yield* (yield* Wakeup.Service).cancel(wait.id as Wakeup.ID, run.session.id)
+    // The fire the scheduler delivers resumes a goal turn carrying the goal's
+    // own prompt plus the fired note, and that turn may report completion.
+    yield* run.llm.push(
+      reply().tool("goal_report", { status: "complete", reason: "The deploy check passed." }),
+      reply().text("Final report").stop(),
+    )
+    const note = "[scheduled wakeup] Check the deploy"
+    yield* GoalLink.resumeOrQueue(run.session.id, note, wait)
+    const done = yield* goalStatus(run, "complete")
+    expect(done.active).toBe(false)
+    const hits = yield* run.llm.hits
+    expect(hits.length).toBeGreaterThan(before)
+    const resumed = hits.slice(before).at(0)
+    expect(JSON.stringify(resumed?.body.messages)).toContain(objective)
+    expect(JSON.stringify(resumed?.body.messages)).toContain(note)
+    expect(toolNames(resumed?.body.tools)).toContain("goal_report")
+  }),
+  30_000,
+)
+
+it.instance(
+  "a recurring cron task keeps the goal waiting after each resumed turn",
+  Effect.gen(function* () {
+    const run = yield* setup()
+    yield* run.llm.push(
+      reply().tool("cron_create", { prompt: "Poll the deploy", cron: "0 0 * * *" }),
+      reply().text("Recurring task scheduled").stop(),
+    )
+    yield* run.command(objective)
+    const waiting = yield* goalStatus(run, "waiting")
+    const wait = waitOf(waiting)
+    expect(wait).toMatchObject({ kind: "cron", recurring: true })
+    // A scheduled task is not progress: no further turn runs before it fires.
+    const before = (yield* run.llm.hits).length
+    yield* Effect.sleep("6 seconds")
+    expect(yield* run.llm.hits).toHaveLength(before)
+    // The task fires, its turn does no work, and the goal re-suspends on the
+    // same recurring task instead of spinning through turns.
+    const note = "[scheduled cron task] Poll the deploy"
+    yield* run.llm.push(reply().text("Nothing to do yet").stop())
+    yield* GoalLink.resumeOrQueue(run.session.id, note, wait)
+    yield* run.wait(before + 1)
+    const again = yield* goalStatus(run, "waiting")
+    expect(again.wait).toMatchObject({ kind: "cron", recurring: true, id: wait.id })
+    const hits = yield* run.llm.hits
+    expect(JSON.stringify(hits.at(before)?.body.messages)).toContain(note)
+    yield* (yield* Wakeup.Service).cronCancel(wait.id as Wakeup.ID)
+  }),
+  30_000,
+)
+
+it.instance(
+  "a goal turn that starts a background process waits on it and resumes when it exits",
+  Effect.gen(function* () {
+    const run = yield* setup({ permission: { bash: "allow" } })
+    yield* run.llm.push(
+      reply().tool("background_process", { action: "start", command: "sleep 5", description: "short wait" }),
+      reply().text("Started the process").stop(),
+    )
+    yield* run.command(objective)
+    const waiting = yield* goalStatus(run, "waiting")
+    const wait = waitOf(waiting)
+    expect(wait).toMatchObject({ kind: "process" })
+    // No turn runs while the process is alive.
+    const before = (yield* run.llm.hits).length
+    yield* run.llm.push(
+      reply().tool("goal_report", { status: "complete", reason: "The process finished." }),
+      reply().text("Final report").stop(),
+    )
+    yield* Effect.sleep("2 seconds")
+    expect(yield* run.llm.hits).toHaveLength(before)
+    // The process exits and the watch resumes the goal with the exit note.
+    const done = yield* goalStatus(run, "complete")
+    expect(done.active).toBe(false)
+    const hits = yield* run.llm.hits
+    expect(hits.length).toBeGreaterThan(before)
+    expect(JSON.stringify(hits.slice(before).at(0)?.body.messages)).toContain(`[background process] ${wait.id}`)
+  }),
+  30_000,
+)
+
+for (const kind of ["cron", "process"] as const) {
+  it.instance(
+    `a goal turn that only ${kind === "cron" ? "schedules a cron task" : "starts a background process"} is not plain progress`,
+    Effect.gen(function* () {
+      const run = yield* setup({ permission: { bash: "allow" } })
+      yield* run.llm.push(
+        kind === "cron"
+          ? reply().tool("cron_create", { prompt: "Poll the deploy", delay: "10s" })
+          : reply().tool("background_process", { action: "start", command: "sleep 10", description: "long wait" }),
+        reply().text("Armed the wait").stop(),
+      )
+      yield* run.command(objective)
+      const waiting = yield* goalStatus(run, "waiting")
+      const wait = waitOf(waiting)
+      expect(wait.kind).toBe(kind === "cron" ? "cron" : "process")
+      expect(wait.recurring).not.toBe(true)
+      // The scheduling call is a wait, not progress: no second goal turn at ~5s.
+      const before = (yield* run.llm.hits).length
+      yield* Effect.sleep("6 seconds")
+      expect(yield* run.llm.hits).toHaveLength(before)
+      if (kind === "cron") yield* (yield* Wakeup.Service).cronCancel(wait.id as Wakeup.ID)
+    }),
+    30_000,
+  )
+}
+
+it.instance(
+  "cancel_wakeup on the awaited id resumes the goal",
+  Effect.gen(function* () {
+    const run = yield* setup()
+    const wake = yield* Wakeup.Service
+    yield* run.llm.push(
+      reply().tool("schedule_wakeup", { prompt: "Check the deploy", delay: "1m" }),
+      reply().text("Waiting for the check").stop(),
+    )
+    yield* run.command(objective)
+    const waiting = yield* goalStatus(run, "waiting")
+    const wait = waitOf(waiting)
+    expect(wait.kind).toBe("wakeup")
+    expect(yield* wake.list({ sessionID: run.session.id })).toHaveLength(1)
+    // The cancel tool drops the awaited wakeup; the scheduler resumes the goal
+    // instead of leaving it stranded on a wait that can never fire.
+    yield* wake.cancel(wait.id as Wakeup.ID, run.session.id)
+    expect(yield* wake.list({ sessionID: run.session.id })).toHaveLength(0)
+    yield* run.llm.push(
+      reply().tool("goal_report", { status: "complete", reason: "The wait was cancelled." }),
+      reply().text("Final report").stop(),
+    )
+    yield* GoalLink.resumeOrQueue(run.session.id, "[cancelled wakeup] Check the deploy", wait)
+    const done = yield* goalStatus(run, "complete")
+    expect(done.active).toBe(false)
+    expect(yield* wake.list({ sessionID: run.session.id })).toHaveLength(0)
+  }),
+  30_000,
+)
+
+it.instance(
+  "a completed goal releases the wakeups and cron tasks it armed",
+  Effect.gen(function* () {
+    const run = yield* setup()
+    const wake = yield* Wakeup.Service
+    // Production registers this seam in the Wakeup layer; whichever build owns
+    // the timer cancels the session's wakeups and cron tasks.
+    let calls = 0
+    GoalLink.registerCleanup((sessionID) =>
+      Effect.tap(wake.cancelSession(sessionID), () =>
+        Effect.sync(() => {
+          calls++
+        }),
+      ),
+    )
+    yield* run.llm.push(
+      reply().tool("schedule_wakeup", { prompt: "Check the deploy", delay: "1m" }),
+      reply().tool("cron_create", { prompt: "Poll the deploy", cron: "0 0 * * *" }),
+      reply().text("Both timers armed").stop(),
+    )
+    yield* run.command(objective)
+    const waiting = yield* goalStatus(run, "waiting")
+    const wait = waitOf(waiting)
+    expect(yield* wake.list({ sessionID: run.session.id })).toHaveLength(1)
+    expect(yield* wake.cronList({ sessionID: run.session.id })).toHaveLength(1)
+    yield* run.llm.push(
+      reply().tool("goal_report", { status: "complete", reason: "Nothing left to do." }),
+      reply().text("Final report").stop(),
+    )
+    yield* GoalLink.resumeOrQueue(run.session.id, "[scheduled cron task] Poll the deploy", wait)
+    const done = yield* goalStatus(run, "complete")
+    expect(done.active).toBe(false)
+    yield* pollWithTimeout(
+      wake
+        .list({ sessionID: run.session.id })
+        .pipe(Effect.map((items) => (items.length === 0 ? true : undefined))),
+      "goal did not release its wakeups",
+      "5 seconds",
+    )
+    yield* pollWithTimeout(
+      wake
+        .cronList({ sessionID: run.session.id })
+        .pipe(Effect.map((items) => (items.length === 0 ? true : undefined))),
+      "goal did not release its cron tasks",
+      "5 seconds",
+    )
+    expect(calls).toBeGreaterThan(0)
+  }),
+  30_000,
+)
+
+it.instance(
+  "a new objective replaces a waiting goal without inheriting its timer",
+  Effect.gen(function* () {
+    const run = yield* setup()
+    const wake = yield* Wakeup.Service
+    // The scheduler registers this seam in production; here it proves the
+    // replaced goal's cron task is really cancelled.
+    GoalLink.registerCleanup((sessionID) => wake.cancelSession(sessionID).pipe(Effect.asVoid))
+    yield* run.llm.push(
+      reply().tool("cron_create", { prompt: "Poll the deploy", cron: "0 0 * * *" }),
+      reply().text("Recurring task scheduled").stop(),
+    )
+    yield* run.command(objective)
+    const waiting = yield* goalStatus(run, "waiting")
+    expect(waitOf(waiting)).toMatchObject({ kind: "cron", recurring: true })
+    expect(yield* wake.cronList({ sessionID: run.session.id })).toHaveLength(1)
+    const next = "Ship the replacement workflow"
+    yield* run.llm.push(
+      reply().tool("goal_report", { status: "complete", reason: "Replacement finished." }),
+      reply().text("Final report").stop(),
+    )
+    yield* run.command(next)
+    const replaced = GoalState.read(yield* run.metadata)
+    expect(replaced?.text).toBe(next)
+    // A new objective must not inherit the replaced goal's wait...
+    expect(replaced?.wait).toBeUndefined()
+    // ...and the replaced goal's cron task goes with the goal it belonged to.
+    expect(yield* wake.cronList({ sessionID: run.session.id })).toHaveLength(0)
+    // The replacement runs its own turn instead of re-suspending on the old task.
+    const done = yield* goalStatus(run, "complete")
+    expect(done.text).toBe(next)
+    expect(done.active).toBe(false)
+  }),
+  30_000,
+)
+
+it.instance(
+  "resuming a waiting goal keeps its recurring task",
+  Effect.gen(function* () {
+    const run = yield* setup()
+    const wake = yield* Wakeup.Service
+    GoalLink.registerCleanup((sessionID) => wake.cancelSession(sessionID).pipe(Effect.asVoid))
+    yield* run.llm.push(
+      reply().tool("cron_create", { prompt: "Poll the deploy", cron: "0 0 * * *" }),
+      reply().text("Recurring task scheduled").stop(),
+    )
+    yield* run.command(objective)
+    const waiting = yield* goalStatus(run, "waiting")
+    const wait = waitOf(waiting)
+    expect(wait).toMatchObject({ kind: "cron", recurring: true })
+    // A resume keeps the task: the turn runs, then the goal waits for the next fire.
+    yield* run.llm.push(shell(), reply().text("Checked the deploy").stop())
+    yield* run.command("resume")
+    const again = yield* goalStatus(run, "waiting")
+    expect(again.wait).toMatchObject({ kind: "cron", recurring: true, id: wait.id })
+    expect(yield* wake.cronList({ sessionID: run.session.id })).toHaveLength(1)
+  }),
+  30_000,
+)
+
+it.instance(
+  "a paused goal waiting on a background process does not restart when it exits",
+  Effect.gen(function* () {
+    const run = yield* setup({ permission: { bash: "allow" } })
+    yield* run.llm.push(
+      reply().tool("background_process", { action: "start", command: "sleep 5", description: "short wait" }),
+      reply().text("Started the process").stop(),
+    )
+    yield* run.command(objective)
+    const waiting = yield* goalStatus(run, "waiting")
+    expect(waitOf(waiting)).toMatchObject({ kind: "process" })
+    // Pause while the watched process is still alive.
+    yield* run.command("pause")
+    expect(GoalState.read(yield* run.metadata)?.status).toBe("paused")
+    const before = (yield* run.llm.hits).length
+    // The process exits well after the pause: a watch that outlived its goal
+    // would resume the paused goal here.
+    yield* Effect.sleep("7 seconds")
+    expect(yield* run.llm.hits).toHaveLength(before)
+    expect(GoalState.read(yield* run.metadata)?.status).toBe("paused")
+  }),
+  30_000,
+)
+
+it.instance(
+  "starting a goal leaves a task armed outside any goal alone",
+  Effect.gen(function* () {
+    const run = yield* setup()
+    const wake = yield* Wakeup.Service
+    GoalLink.registerCleanup((sessionID) => wake.cancelSession(sessionID).pipe(Effect.asVoid))
+    // A task armed with no goal active belongs to the session, not to a goal.
+    const instance = yield* TestInstance
+    yield* wake.cronCreate({
+      sessionID: run.session.id,
+      directory: instance.directory,
+      prompt: "Poll the deploy",
+      cron: "0 0 * * *",
+    })
+    yield* run.llm.push(shell(), reply().text("Checked the deploy").stop())
+    yield* run.command(objective)
+    expect(GoalState.read(yield* run.metadata)?.text).toBe(objective)
+    expect(yield* wake.cronList({ sessionID: run.session.id })).toHaveLength(1)
+  }),
+  30_000,
+)
+
