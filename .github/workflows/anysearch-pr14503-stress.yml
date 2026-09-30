@@ -1,0 +1,103 @@
+name: AnySearch PR14503 stress
+
+on:
+  push:
+    branches:
+      - stress/anysearch-pr14503-20261001
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  targeted-stress:
+    name: targeted stress / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            shell: bash
+          - os: windows-latest
+            shell: pwsh
+          - os: macos-latest
+            shell: bash
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Bun and dependencies
+        uses: ./.github/actions/setup-bun
+
+      - name: Configure git identity
+        shell: bash
+        run: |
+          git config --global user.email "stress-ci[bot]@users.noreply.github.com"
+          git config --global user.name "stress-ci[bot]"
+
+      - name: Targeted AnySearch tests x50
+        if: runner.os != 'Windows'
+        working-directory: packages/opencode
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(
+            "./test/kilocode/tool/websearch-anysearch.test.ts"
+            "./test/tool/websearch.test.ts"
+            "./test/kilocode/tool/websearch-kilo-exa.test.ts"
+          )
+          for i in $(seq 1 50); do
+            case $((i % 6)) in
+              0) order=("${files[0]}" "${files[1]}" "${files[2]}") ;;
+              1) order=("${files[0]}" "${files[2]}" "${files[1]}") ;;
+              2) order=("${files[1]}" "${files[0]}" "${files[2]}") ;;
+              3) order=("${files[1]}" "${files[2]}" "${files[0]}") ;;
+              4) order=("${files[2]}" "${files[0]}" "${files[1]}") ;;
+              5) order=("${files[2]}" "${files[1]}" "${files[0]}") ;;
+            esac
+            echo "round=$i order=${order[*]}"
+            bun test "${order[@]}" --timeout 60000
+          done
+
+      - name: Targeted AnySearch tests x50 (Windows)
+        if: runner.os == 'Windows'
+        working-directory: packages/opencode
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $perms = @(
+            @('./test/kilocode/tool/websearch-anysearch.test.ts','./test/tool/websearch.test.ts','./test/kilocode/tool/websearch-kilo-exa.test.ts'),
+            @('./test/kilocode/tool/websearch-anysearch.test.ts','./test/kilocode/tool/websearch-kilo-exa.test.ts','./test/tool/websearch.test.ts'),
+            @('./test/tool/websearch.test.ts','./test/kilocode/tool/websearch-anysearch.test.ts','./test/kilocode/tool/websearch-kilo-exa.test.ts'),
+            @('./test/tool/websearch.test.ts','./test/kilocode/tool/websearch-kilo-exa.test.ts','./test/kilocode/tool/websearch-anysearch.test.ts'),
+            @('./test/kilocode/tool/websearch-kilo-exa.test.ts','./test/kilocode/tool/websearch-anysearch.test.ts','./test/tool/websearch.test.ts'),
+            @('./test/kilocode/tool/websearch-kilo-exa.test.ts','./test/tool/websearch.test.ts','./test/kilocode/tool/websearch-anysearch.test.ts')
+          )
+          for ($i = 1; $i -le 50; $i++) {
+            $order = $perms[$i % 6]
+            Write-Host "round=$i order=$($order -join ' ')"
+            & bun test @order --timeout 60000
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: CLI typecheck
+        working-directory: packages/opencode
+        run: bun run typecheck
+
+      - name: Targeted format check
+        shell: bash
+        run: |
+          bunx prettier --check             packages/opencode/src/kilocode/tool/websearch-anysearch.ts             packages/opencode/src/tool/websearch.ts             packages/opencode/test/kilocode/tool/websearch-anysearch.test.ts             packages/opencode/test/tool/websearch.test.ts             packages/opencode/test/kilocode/tool/websearch-kilo-exa.test.ts
+
+      - name: Targeted lint
+        shell: bash
+        run: |
+          bunx oxlint             packages/opencode/src/kilocode/tool/websearch-anysearch.ts             packages/opencode/src/tool/websearch.ts             packages/opencode/test/kilocode/tool/websearch-anysearch.test.ts             packages/opencode/test/tool/websearch.test.ts             packages/opencode/test/kilocode/tool/websearch-kilo-exa.test.ts
+
+      - name: Diff integrity
+        shell: bash
+        run: git diff --check
